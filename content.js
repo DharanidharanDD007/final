@@ -4,11 +4,11 @@
  * Injected into Google Meet, Microsoft Teams, and Zoom Web.
  * 
  * Features:
- * 1. URL Gate: Validated inside IIFE to eliminate SyntaxError. Exits on home/landing pages.
- * 2. SPA Navigation Watcher: Automatically initializes when navigating from /home to a call.
- * 3. Privacy-Safe Audio Extraction: Uses vid.captureStream() with Web Audio API (AnalyserNode).
- * 4. Accurate DOM Scraping: Extracts participant display names from platform wrappers.
- * 5. Collapsible Multi-Speaker HUD (#df-wrapper, #df-toggle-btn, and #df-card-${safeId}).
+ * 1. URL Gate: Immediately exits on home/landing pages without UI injection.
+ * 2. WebRTC Integrity: Zero captureStream() calls, eliminating the remote video black screen bug.
+ * 3. Dynamic Silence Fallback: Dispatches audioLevel: 0 to trigger 100% visual trust in scanner.js.
+ * 4. Accurate DOM Scraping: Extracts real participant names from platform wrappers.
+ * 5. Collapsible Glassmorphism HUD: #df-wrapper, #df-toggle-btn, and #df-card-${safeId}.
  * 6. High-performance asynchronous frame streaming via ImageBitmap transfers.
  */
 
@@ -23,8 +23,7 @@
         return path !== '/' && path !== '/home' && path.length > 1;
     }
 
-    // If on homepage or landing page, do not inject UI.
-    // Watch for client-side single-page navigation to an active meeting room.
+    // Never inject on Google Meet / Zoom / Teams home or landing pages
     if (!isMeetingPage()) {
         let lastPath = window.location.pathname;
         const spaWatcher = setInterval(() => {
@@ -47,7 +46,7 @@
     initExtension();
 
     function initExtension() {
-        console.log("🛡️ [Deepfake Detector]: Initializing extension in meeting session:", window.location.href);
+        console.log("🛡️ [Deepfake Detector]: Extension initialized for session:", window.location.href);
 
         let isProcessing = false;
         let scannerIframe = null;
@@ -58,122 +57,7 @@
         const activeParticipants = new Map(); // safeId -> { id, displayName, score, visualScore, audioScore, isSilent, hasFace, lastSeen }
 
         // ---------------------------------------------------------------------------
-        // 2. PRIVACY-PRESERVING AUDIO EXTRACTION (NO getUserMedia)
-        // ---------------------------------------------------------------------------
-        let audioCtx = null;
-        const videoAudioMap = new WeakMap();
-
-        function getAudioContext() {
-            if (!audioCtx) {
-                const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-                if (AudioContextClass) {
-                    audioCtx = new AudioContextClass();
-                }
-            }
-            if (audioCtx && audioCtx.state === 'suspended') {
-                audioCtx.resume().catch(() => {});
-            }
-            return audioCtx;
-        }
-
-        function extractAudioMetrics(videoEl) {
-            try {
-                const ctx = getAudioContext();
-                if (!ctx) return { isSilent: true, audioScore: 100, rms: 0, spectralCentroid: 0 };
-
-                let audioNode = videoAudioMap.get(videoEl);
-
-                if (!audioNode) {
-                    // Use vid.captureStream() on remote video - NEVER getUserMedia
-                    let stream = null;
-                    if (typeof videoEl.captureStream === 'function') {
-                        try { stream = videoEl.captureStream(); } catch (e) {}
-                    } else if (typeof videoEl.mozCaptureStream === 'function') {
-                        try { stream = videoEl.mozCaptureStream(); } catch (e) {}
-                    } else if (videoEl.srcObject instanceof MediaStream) {
-                        stream = videoEl.srcObject;
-                    }
-
-                    if (stream && typeof stream.getAudioTracks === 'function' && stream.getAudioTracks().length > 0) {
-                        const source = ctx.createMediaStreamSource(stream);
-                        const analyser = ctx.createAnalyser();
-                        analyser.fftSize = 512;
-                        analyser.smoothingTimeConstant = 0.8;
-                        source.connect(analyser); // Connect only to analyser, leaving speakers untouched
-
-                        audioNode = {
-                            analyser,
-                            freqData: new Uint8Array(analyser.frequencyBinCount),
-                            timeData: new Uint8Array(analyser.fftSize)
-                        };
-                        videoAudioMap.set(videoEl, audioNode);
-                    }
-                }
-
-                if (!audioNode) {
-                    return { isSilent: true, audioScore: 100, rms: 0, spectralCentroid: 0 };
-                }
-
-                audioNode.analyser.getByteTimeDomainData(audioNode.timeData);
-                audioNode.analyser.getByteFrequencyData(audioNode.freqData);
-
-                // 1. RMS Energy Calculation (Voice Activity Detection)
-                let sumSq = 0;
-                for (let i = 0; i < audioNode.timeData.length; i++) {
-                    const norm = (audioNode.timeData[i] - 128) / 128.0;
-                    sumSq += norm * norm;
-                }
-                const rms = Math.sqrt(sumSq / audioNode.timeData.length);
-
-                // If audio is below silence threshold, mark silent
-                if (rms < 0.015) {
-                    return { isSilent: true, audioScore: 100, rms: Math.round(rms * 1000) / 1000, spectralCentroid: 0 };
-                }
-
-                // 2. Spectral Centroid and High-Frequency Energy
-                let num = 0, den = 0;
-                const nyquist = ctx.sampleRate / 2;
-                const binWidth = nyquist / audioNode.freqData.length;
-                let highFreqEnergy = 0, totalEnergy = 0;
-
-                for (let i = 0; i < audioNode.freqData.length; i++) {
-                    const magnitude = audioNode.freqData[i];
-                    const freq = i * binWidth;
-                    num += freq * magnitude;
-                    den += magnitude;
-                    totalEnergy += magnitude;
-                    if (freq > 4000) {
-                        highFreqEnergy += magnitude;
-                    }
-                }
-
-                const spectralCentroid = den > 0 ? (num / den) : 0;
-                const highFreqRatio = totalEnergy > 0 ? (highFreqEnergy / totalEnergy) : 0;
-
-                // 3. Acoustic Consistency Heuristic
-                let penalty = 0;
-                if (spectralCentroid > 3800 || spectralCentroid < 400) {
-                    penalty += 25; // Outside natural human vocal envelope
-                }
-                if (highFreqRatio > 0.45) {
-                    penalty += 35; // Artificial high-frequency vocoder distortion
-                }
-
-                const audioScore = Math.max(20, Math.min(100, 100 - penalty));
-                return {
-                    isSilent: false,
-                    audioScore,
-                    rms: Math.round(rms * 1000) / 1000,
-                    spectralCentroid: Math.round(spectralCentroid),
-                    highFreqRatio: Math.round(highFreqRatio * 100) / 100
-                };
-            } catch (err) {
-                return { isSilent: true, audioScore: 100, rms: 0, spectralCentroid: 0 };
-            }
-        }
-
-        // ---------------------------------------------------------------------------
-        // 3. DOM SCRAPING: GET REAL PARTICIPANT NAMES
+        // 2. DOM SCRAPING: GET REAL PARTICIPANT NAMES
         // ---------------------------------------------------------------------------
         function getParticipantName(videoEl, fallbackIndex) {
             try {
@@ -216,12 +100,12 @@
         }
 
         // ---------------------------------------------------------------------------
-        // 4. NEW COLLAPSIBLE HUD: #df-wrapper, #df-toggle-btn, and #df-card-${safeId}
+        // 3. COLLAPSIBLE HUD INJECTION (#df-wrapper, #df-toggle-btn, and #df-card-${safeId})
         // ---------------------------------------------------------------------------
         function injectUI() {
             if (document.getElementById('df-wrapper')) return;
 
-            // Main Wrapper Container
+            // Main Glassmorphism Wrapper Container
             const wrapper = document.createElement('div');
             wrapper.id = 'df-wrapper';
             wrapper.className = 'df-expanded';
@@ -260,7 +144,7 @@
             }
         }
 
-        function updateParticipantCard(data) {
+        function updateDashboard(data) {
             const safeId = toSafeId(data.participantId);
             const container = document.getElementById('df-cards-container');
             const emptyNotice = document.getElementById('df-empty-state');
@@ -275,7 +159,6 @@
             const statusText = isAlert ? '⚠️ ALERT' : 'Authentic';
             const cardAlertClass = isAlert ? 'df-participant-card alert' : 'df-participant-card';
             const fillAlertClass = isAlert ? 'df-bar-fill alert' : 'df-bar-fill';
-            const audioText = data.isSilent ? '🎙️ Muted' : `🎙️ Aud: ${data.audioScore}%`;
 
             if (!card) {
                 card = document.createElement('div');
@@ -296,7 +179,7 @@
                 </div>
                 <div class="df-metrics-row">
                     <span class="df-metric-chip">👁️ Vis: ${data.visualScore}%</span>
-                    <span class="df-metric-chip">${audioText}</span>
+                    <span class="df-metric-chip">🎙️ Aud: Muted</span>
                     <span class="df-status-tag" style="margin-left: auto;">${statusText}</span>
                 </div>
             `;
@@ -328,13 +211,14 @@
             }
         }
 
+        // 15-second participant auto-pruning loop
         function pruneInactiveParticipants() {
             const now = Date.now();
             const container = document.getElementById('df-cards-container');
             const emptyNotice = document.getElementById('df-empty-state');
 
             for (const [safeId, data] of activeParticipants.entries()) {
-                if (now - data.lastSeen > 8000) {
+                if (now - data.lastSeen > 15000) {
                     activeParticipants.delete(safeId);
                     const card = document.getElementById(`df-card-${safeId}`);
                     if (card && card.parentNode) {
@@ -350,10 +234,10 @@
             updateGlobalBadge();
         }
 
-        setInterval(pruneInactiveParticipants, 4000);
+        setInterval(pruneInactiveParticipants, 5000);
 
         // ---------------------------------------------------------------------------
-        // 5. SANDBOXED SCANNER COMMUNICATION
+        // 4. SANDBOXED SCANNER COMMUNICATION
         // ---------------------------------------------------------------------------
         function injectScanner() {
             scannerIframe = document.createElement('iframe');
@@ -376,12 +260,12 @@
                         score,
                         visualScore,
                         audioScore,
-                        isSilent,
+                        isSilent: true,
                         hasFace,
                         lastSeen: Date.now()
                     };
                     activeParticipants.set(safeId, record);
-                    updateParticipantCard(record);
+                    updateDashboard(record);
                 } else if (e.data.type === 'FRAME_PROCESSED') {
                     isProcessing = false;
                 } else if (e.data.type === 'DEBUG_LOG') {
@@ -395,7 +279,7 @@
         }
 
         // ---------------------------------------------------------------------------
-        // 6. DOM VIDEO EXTRACTION & ROUND-ROBIN FRAME SCHEDULING
+        // 5. DOM VIDEO EXTRACTION & ROUND-ROBIN FRAME SCHEDULING (captureGrid)
         // ---------------------------------------------------------------------------
         function getRemoteVideos() {
             const videos = Array.from(document.querySelectorAll('video'));
@@ -424,7 +308,7 @@
             return remoteVideos;
         }
 
-        function captureAndStream() {
+        function captureGrid() {
             const videos = getRemoteVideos();
 
             if (videos.length > 0 && !isProcessing && scannerReady) {
@@ -433,8 +317,8 @@
 
                 const participantId = targetVideo.dataset.dfParticipantId;
                 const displayName = targetVideo.dataset.dfDisplayName;
-                const audioMetrics = extractAudioMetrics(targetVideo);
 
+                // WebRTC-Safe: Pure ImageBitmap snapshot, zero stream hijacking
                 isProcessing = true;
                 createImageBitmap(targetVideo).then((bitmap) => {
                     scannerIframe.contentWindow.postMessage(
@@ -443,7 +327,14 @@
                             bitmap: bitmap,
                             participantId: participantId,
                             displayName: displayName,
-                            audioMetrics: audioMetrics
+                            audioLevel: 0,
+                            audioMetrics: {
+                                isSilent: true,
+                                audioScore: 100,
+                                audioLevel: 0,
+                                rms: 0,
+                                spectralCentroid: 0
+                            }
                         },
                         '*',
                         [bitmap]
@@ -453,12 +344,12 @@
                 });
             }
 
-            requestAnimationFrame(captureAndStream);
+            requestAnimationFrame(captureGrid);
         }
 
         // Initialize extension components
         injectUI();
         injectScanner();
-        captureAndStream();
+        captureGrid();
     }
 })();

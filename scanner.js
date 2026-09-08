@@ -294,11 +294,14 @@ async function processQueue() {
 
     isProcessingQueue = true;
     const task = frameQueue.shift();
-    const { bitmap, participantId, displayName, audioMetrics } = task;
+    const { bitmap, participantId, displayName, audioMetrics, audioLevel } = task;
 
     currentParticipantId = participantId || 'default';
     currentDisplayName = displayName || 'Remote Caller';
     currentAudioMetrics = audioMetrics || { isSilent: true, audioScore: 100 };
+    if (audioLevel === 0 || (audioMetrics && audioMetrics.audioLevel === 0)) {
+        currentAudioMetrics.isSilent = true;
+    }
 
     try {
         ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
