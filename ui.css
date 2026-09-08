@@ -1,110 +1,181 @@
-#df-dashboard {
+/* ==========================================================================
+   Real-Time Deepfake Detector - In-Call HUD Stylesheet
+   Collapsible Glassmorphism Design (#df-wrapper, #df-toggle-btn, #df-card-${safeId})
+   ========================================================================== */
+
+#df-wrapper {
     position: fixed;
     top: 20px;
     right: 20px;
-    width: 250px;
-    max-height: 80vh;
-    overflow-y: auto;
+    z-index: 2147483647; /* Maximum z-index to overlay video calling controls */
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    color: #f8fafc;
+    user-select: none;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Floating Toggle Button */
+#df-toggle-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     background: rgba(15, 23, 42, 0.88);
     backdrop-filter: blur(12px);
-    border: 2px solid #00ff88;
+    -webkit-backdrop-filter: blur(12px);
+    border: 1.5px solid #00ff88;
+    border-radius: 24px;
+    padding: 8px 14px;
+    cursor: pointer;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+    transition: all 0.2s ease;
+    margin-left: auto;
+    width: fit-content;
+}
+
+#df-toggle-btn:hover {
+    background: rgba(30, 41, 59, 0.95);
+    border-color: #00d2ff;
+    transform: translateY(-1px);
+}
+
+.df-shield-icon {
+    font-size: 14px;
+}
+
+.df-toggle-text {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: #00ff88;
+}
+
+#df-wrapper.has-alert #df-toggle-btn {
+    border-color: #ef4444;
+    animation: df-pulse 1.5s infinite;
+}
+
+#df-wrapper.has-alert .df-toggle-text {
+    color: #ef4444;
+}
+
+@keyframes df-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); }
+    50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+}
+
+/* Collapsible Panel */
+#df-panel {
+    margin-top: 8px;
+    width: 270px;
+    max-height: 80vh;
+    overflow-y: auto;
+    background: rgba(15, 23, 42, 0.9);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1.5px solid rgba(0, 255, 136, 0.35);
     border-radius: 14px;
-    padding: 14px;
-    color: #f8fafc;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-    z-index: 999999;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
-    transition: border-color 0.3s ease, box-shadow 0.3s ease;
+    padding: 12px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     box-sizing: border-box;
 }
 
-#df-dashboard::-webkit-scrollbar {
+#df-wrapper.df-collapsed #df-panel {
+    display: none;
+}
+
+#df-panel::-webkit-scrollbar {
     width: 4px;
 }
-#df-dashboard::-webkit-scrollbar-thumb {
+#df-panel::-webkit-scrollbar-thumb {
     background: rgba(255, 255, 255, 0.2);
     border-radius: 4px;
 }
 
-.df-header-row {
+/* Panel Header */
+.df-panel-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    padding-bottom: 8px;
     margin-bottom: 8px;
-    padding-bottom: 6px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
 
-.df-title {
+.df-panel-title {
     font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1.2px;
     font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
     color: #94a3b8;
 }
 
-.df-status-pill {
+.df-badge {
     font-size: 10px;
     font-weight: 700;
+    text-transform: uppercase;
     padding: 2px 7px;
     border-radius: 10px;
-    text-transform: uppercase;
     background: rgba(0, 255, 136, 0.15);
     color: #00ff88;
 }
 
-.df-status-pill.alert {
+.df-badge.alert {
     background: rgba(239, 68, 68, 0.2);
     color: #ef4444;
 }
 
-.df-participant-list {
+/* Cards Container */
+#df-cards-container {
     display: flex;
     flex-direction: column;
     gap: 8px;
 }
 
-.df-card {
+/* Individual Participant Cards */
+.df-participant-card {
     background: rgba(30, 41, 59, 0.65);
     border-radius: 8px;
-    padding: 9px;
+    padding: 10px;
     border-left: 3px solid #00ff88;
     transition: all 0.25s ease;
 }
 
-.df-card.alert {
+.df-participant-card.alert {
     border-left-color: #ef4444;
     background: rgba(239, 68, 68, 0.12);
 }
 
-.df-card-header {
+.df-card-top {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 4px;
+    margin-bottom: 6px;
 }
 
-.df-card-name {
+.df-name {
     font-size: 12px;
     font-weight: 600;
     color: #e2e8f0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 130px;
+    max-width: 170px;
 }
 
-.df-card-score {
+.df-score-val {
     font-size: 13px;
     font-weight: 700;
     color: #00ff88;
 }
 
-.df-card.alert .df-card-score {
+.df-participant-card.alert .df-score-val {
     color: #ef4444;
 }
 
-.df-progress-bar {
+/* Progress Bar */
+.df-bar-track {
     height: 4px;
     background: rgba(255, 255, 255, 0.1);
     border-radius: 2px;
@@ -112,32 +183,43 @@
     margin-bottom: 6px;
 }
 
-.df-progress-fill {
+.df-bar-fill {
     height: 100%;
     background: #00ff88;
     transition: width 0.3s ease, background-color 0.3s ease;
 }
 
-.df-progress-fill.alert {
+.df-bar-fill.alert {
     background: #ef4444;
 }
 
-.df-chips-row {
+/* Metrics Row */
+.df-metrics-row {
     display: flex;
+    align-items: center;
     gap: 6px;
     font-size: 10px;
     color: #94a3b8;
 }
 
-.df-chip {
+.df-metric-chip {
     background: rgba(15, 23, 42, 0.5);
     padding: 1px 5px;
     border-radius: 4px;
+}
+
+.df-status-tag {
+    font-weight: 600;
+    color: #00ff88;
+}
+
+.df-participant-card.alert .df-status-tag {
+    color: #ef4444;
 }
 
 .df-empty-notice {
     font-size: 11px;
     color: #64748b;
     text-align: center;
-    padding: 12px 0;
+    padding: 14px 0;
 }

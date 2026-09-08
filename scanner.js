@@ -4,14 +4,13 @@
  * Runs inside the sandboxed iframe (scanner.html).
  * 
  * Key Responsibilities:
- * 1. Initializes MediaPipe FaceMesh and TensorFlow.js CNN Model with WebGL backend.
- * 2. Receives raw video frames and audio spectral metrics per participantId.
- * 3. Extracts face bounding box dynamically from MediaPipe landmarks with a 15% margin.
- * 4. Crops and renders the face ROI to an offscreen 64x64 canvas.
- * 5. Preprocesses to [1, 64, 64, 1] grayscale normalized tensor (div 255.0).
- * 6. Executes CNN inference with strict WebGL memory leak prevention (tf.tidy + dispose).
- * 7. Maintains independent 15-frame rolling average buffers keyed by participantId.
- * 8. Fuses visual trust and Web Audio spectral consistency into a unified Multimodal Trust Score:
+ * 1. Synchronous Multi-Participant FIFO Queue (processQueue()).
+ * 2. MediaPipe FaceMesh & TensorFlow.js WebGL model execution.
+ * 3. 15% Boundary margin face ROI extraction to capture boundary blending artifacts.
+ * 4. Normalizes face ROI to [1, 64, 64, 1] grayscale tensor.
+ * 5. Memory leak prevention via tf.tidy() and .dispose().
+ * 6. Independent 15-frame temporal buffers using participantStates = new Map().
+ * 7. Multimodal Fusion:
  *       Final Trust Score = (w_v * Visual Trust) + (w_a * Audio Consistency Score)
  *       (with silence fallback to pure visual when speech is inactive).
  */
@@ -19,7 +18,7 @@
 const canvas = document.getElementById('offscreenCanvas');
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-// Auxiliary 64x64 offscreen canvas for GPU-accelerated face cropping and scaling
+// Auxiliary 64x64 offscreen canvas for face ROI cropping and scaling
 const faceCanvas = document.createElement('canvas');
 faceCanvas.width = 64;
 faceCanvas.height = 64;
@@ -30,42 +29,44 @@ let cnnModel;
 let isModelReady = false;
 
 // ---------------------------------------------------------------------------
-// MULTI-PARTICIPANT STATE & TEMPORAL BUFFER CONFIGURATION
+// 1. SYNCHRONOUS MULTI-PARTICIPANT QUEUE & INDEPENDENT TEMPORAL BUFFERS
 // ---------------------------------------------------------------------------
 const BUFFER_SIZE = 15;
-const participantBuffers = new Map();
+const participantStates = new Map(); // id -> { visualBuffer: [], audioBuffer: [], fusedBuffer: [], consecutiveNoFace: 0, lastSeen, displayName }
 
-// Context variables for the frame currently undergoing inference
+const frameQueue = [];
+let isProcessingQueue = false;
+
 let currentParticipantId = 'default';
 let currentDisplayName = 'Remote Caller';
 let currentAudioMetrics = { isSilent: true, audioScore: 100 };
 
-// Auto-prune inactive participants after 15 seconds of inactivity
+// Auto-prune inactive participants after 15 seconds
 setInterval(() => {
     const now = Date.now();
-    for (const [id, state] of participantBuffers.entries()) {
+    for (const [id, state] of participantStates.entries()) {
         if (now - state.lastSeen > 15000) {
-            participantBuffers.delete(id);
+            participantStates.delete(id);
         }
     }
-}, 10000);
+}, 8000);
 
 /**
- * Posts diagnostic logs back to the parent window for devtools inspection.
+ * Diagnostic logger to parent window
  */
 function logToMain(msg, isError = false) {
     window.parent.postMessage({ type: 'DEBUG_LOG', message: msg, isError: isError }, '*');
 }
 
 /**
- * Loads the TensorFlow.js CNN Model exported from train_cnn.py.
+ * Loads the TensorFlow.js CNN Model
  */
 async function loadModel() {
     try {
         logToMain("Loading CNN Model from './models/model.json'...");
         cnnModel = await tf.loadLayersModel('./models/model.json');
-        
-        // Warm up the WebGL engine with a dummy tensor [1, 64, 64, 1]
+
+        // Warm up WebGL backend
         tf.tidy(() => {
             const dummy = tf.zeros([1, 64, 64, 1]);
             cnnModel.predict(dummy);
@@ -78,7 +79,7 @@ async function loadModel() {
 }
 
 /**
- * Initializes MediaPipe FaceMesh.
+ * Initializes MediaPipe FaceMesh engine
  */
 async function initFaceMesh() {
     try {
@@ -86,7 +87,10 @@ async function initFaceMesh() {
 
         logToMain("Initializing MediaPipe FaceMesh engine...");
         faceMesh = new FaceMesh({
-            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+            locateFile: (file) => {
+                // Try local mediapipe/ directory first, fallback to CDN if not local
+                return `./mediapipe/${file}`;
+            }
         });
 
         faceMesh.setOptions({
@@ -105,13 +109,30 @@ async function initFaceMesh() {
         logToMain("FaceMesh & CNN Multimodal Pipeline Ready!");
         window.parent.postMessage({ type: 'SCANNER_READY' }, '*');
     } catch (err) {
-        logToMain("ERROR initializing FaceMesh: " + err.message, true);
+        logToMain("ERROR initializing FaceMesh with local files, retrying with CDN: " + err.message, false);
+        try {
+            faceMesh = new FaceMesh({
+                locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+            });
+            faceMesh.setOptions({
+                maxNumFaces: 1,
+                refineLandmarks: true,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+            faceMesh.onResults(onFaceMeshResults);
+            await faceMesh.initialize();
+            isModelReady = true;
+            logToMain("FaceMesh & CNN Multimodal Pipeline Ready (via CDN)!");
+            window.parent.postMessage({ type: 'SCANNER_READY' }, '*');
+        } catch (cdnErr) {
+            logToMain("CRITICAL ERROR initializing FaceMesh: " + cdnErr.message, true);
+        }
     }
 }
 
 /**
- * Computes bounding box from normalized landmarks and adds a 15% boundary margin.
- * Captures edge blending artifacts where face swaps are composited.
+ * Computes bounding box from normalized landmarks and adds 15% safety boundary margin
  */
 function computeFaceBoundingBox(landmarks, imgWidth, imgHeight) {
     let minX = 1.0, minY = 1.0, maxX = 0.0, maxY = 0.0;
@@ -141,20 +162,20 @@ function computeFaceBoundingBox(landmarks, imgWidth, imgHeight) {
 }
 
 /**
- * Callback invoked every time MediaPipe finishes processing a video frame.
+ * Callback invoked every time MediaPipe finishes processing a video frame
  */
 function onFaceMeshResults(results) {
-    let state = participantBuffers.get(currentParticipantId);
+    let state = participantStates.get(currentParticipantId);
     if (!state) {
         state = {
-            visualQueue: [],
-            audioQueue: [],
-            combinedQueue: [],
+            visualBuffer: [],
+            audioBuffer: [],
+            fusedBuffer: [],
             consecutiveNoFace: 0,
             lastSeen: Date.now(),
             displayName: currentDisplayName
         };
-        participantBuffers.set(currentParticipantId, state);
+        participantStates.set(currentParticipantId, state);
     }
     state.lastSeen = Date.now();
     state.displayName = currentDisplayName;
@@ -170,7 +191,7 @@ function onFaceMeshResults(results) {
                 return;
             }
 
-            // 1. Crop face ROI from main canvas and scale into 64x64 auxiliary canvas
+            // 1. Crop face ROI and scale into 64x64 auxiliary canvas
             faceCtx.clearRect(0, 0, 64, 64);
             faceCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, 64, 64);
 
@@ -179,59 +200,59 @@ function onFaceMeshResults(results) {
                 return tf.browser.fromPixels(faceCanvas, 1)
                     .toFloat()
                     .div(255.0)
-                    .expandDims(0); // Shape: [1, 64, 64, 1]
+                    .expandDims(0);
             });
 
-            // 3. Run CNN Inference
+            // 3. CNN WebGL Inference
             const prediction = cnnModel.predict(tensorInput);
-            const fakeProb = prediction.dataSync()[0]; // Sigmoid output: 0.0 = Real, 1.0 = Fake
+            const fakeProb = prediction.dataSync()[0]; // 0.0 = Real, 1.0 = Fake
 
-            // Dispose explicit tensors outside tf.tidy to prevent WebGL GPU memory leaks
+            // Dispose tensors outside tf.tidy to avoid GPU memory leaks
             tensorInput.dispose();
             prediction.dispose();
 
             // 4. Calculate Frame Visual Trust Score (100% = Authentic, 0% = Manipulated)
             const frameVisualTrust = Math.max(0, Math.min(100, (1.0 - fakeProb) * 100));
-            state.visualQueue.push(frameVisualTrust);
-            if (state.visualQueue.length > BUFFER_SIZE) {
-                state.visualQueue.shift();
+            state.visualBuffer.push(frameVisualTrust);
+            if (state.visualBuffer.length > BUFFER_SIZE) {
+                state.visualBuffer.shift();
             }
 
-            // 5. Audio Consistency Score from payload
+            // 5. Audio Consistency Score
             const audioConsistency = currentAudioMetrics.audioScore !== undefined ? currentAudioMetrics.audioScore : 100;
-            state.audioQueue.push(audioConsistency);
-            if (state.audioQueue.length > BUFFER_SIZE) {
-                state.audioQueue.shift();
+            state.audioBuffer.push(audioConsistency);
+            if (state.audioBuffer.length > BUFFER_SIZE) {
+                state.audioBuffer.shift();
             }
 
-            // 6. Multimodal Fusion:
-            // Final Trust = (w_v * Visual) + (w_a * Audio)
-            // If caller is muted/silent, adapt weights dynamically to pure visual (w_v=1.0, w_a=0.0)
-            let frameCombinedTrust;
+            // 6. Multimodal Fusion Equation:
+            // Final Trust Score = (w_v * Visual Trust) + (w_a * Audio Consistency Score)
+            let frameFusedTrust;
             if (currentAudioMetrics.isSilent) {
-                frameCombinedTrust = frameVisualTrust;
+                // If caller is silent or muted, dynamic fallback to pure visual (w_v = 1.0, w_a = 0.0)
+                frameFusedTrust = frameVisualTrust;
             } else {
                 const w_v = 0.75;
                 const w_a = 0.25;
-                frameCombinedTrust = (w_v * frameVisualTrust) + (w_a * audioConsistency);
+                frameFusedTrust = (w_v * frameVisualTrust) + (w_a * audioConsistency);
             }
 
-            state.combinedQueue.push(frameCombinedTrust);
-            if (state.combinedQueue.length > BUFFER_SIZE) {
-                state.combinedQueue.shift();
+            state.fusedBuffer.push(frameFusedTrust);
+            if (state.fusedBuffer.length > BUFFER_SIZE) {
+                state.fusedBuffer.shift();
             }
 
-            // 7. Compute temporal moving averages to eliminate flickering
-            const avgCombined = Math.round(state.combinedQueue.reduce((a, b) => a + b, 0) / state.combinedQueue.length);
-            const avgVisual = Math.round(state.visualQueue.reduce((a, b) => a + b, 0) / state.visualQueue.length);
-            const avgAudio = Math.round(state.audioQueue.reduce((a, b) => a + b, 0) / state.audioQueue.length);
+            // 7. Compute temporal moving averages across independent buffers
+            const avgFused = Math.round(state.fusedBuffer.reduce((a, b) => a + b, 0) / state.fusedBuffer.length);
+            const avgVisual = Math.round(state.visualBuffer.reduce((a, b) => a + b, 0) / state.visualBuffer.length);
+            const avgAudio = Math.round(state.audioBuffer.reduce((a, b) => a + b, 0) / state.audioBuffer.length);
 
-            // 8. Transmit multimodal metrics to content script UI
+            // 8. Transmit fused result to content script
             window.parent.postMessage({
                 type: 'SCORE_UPDATE',
                 participantId: currentParticipantId,
                 displayName: currentDisplayName,
-                score: avgCombined,
+                score: avgFused,
                 visualScore: avgVisual,
                 audioScore: avgAudio,
                 isSilent: currentAudioMetrics.isSilent,
@@ -242,13 +263,13 @@ function onFaceMeshResults(results) {
             logToMain("Inference Error in scanner.js: " + err.message, true);
         }
     } else {
-        // No face detected in this frame
+        // No face detected in frame
         state.consecutiveNoFace++;
-        
+
         if (state.consecutiveNoFace > BUFFER_SIZE) {
-            state.visualQueue.length = 0;
-            state.audioQueue.length = 0;
-            state.combinedQueue.length = 0;
+            state.visualBuffer.length = 0;
+            state.audioBuffer.length = 0;
+            state.fusedBuffer.length = 0;
             window.parent.postMessage({
                 type: 'SCORE_UPDATE',
                 participantId: currentParticipantId,
@@ -264,37 +285,58 @@ function onFaceMeshResults(results) {
 }
 
 /**
- * Handle incoming frames transferred from content.js.
+ * Multi-Participant Synchronous Queue Processor (processQueue())
  */
-window.addEventListener('message', async (e) => {
-    if (e.data.type === 'PROCESS_FRAME' && isModelReady) {
-        const { bitmap, participantId, displayName, audioMetrics } = e.data;
-        currentParticipantId = participantId || 'default';
-        currentDisplayName = displayName || 'Remote Caller';
-        currentAudioMetrics = audioMetrics || { isSilent: true, audioScore: 100 };
+async function processQueue() {
+    if (isProcessingQueue || frameQueue.length === 0 || !isModelReady) {
+        return;
+    }
 
-        try {
-            ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-            await faceMesh.send({ image: canvas });
-        } catch (err) {
-            logToMain("Frame processing error: " + err.message, true);
-        } finally {
-            bitmap.close();
-            // ALWAYS post FRAME_PROCESSED so content.js isProcessing lock is released
-            window.parent.postMessage({
-                type: 'FRAME_PROCESSED',
-                participantId: currentParticipantId
-            }, '*');
+    isProcessingQueue = true;
+    const task = frameQueue.shift();
+    const { bitmap, participantId, displayName, audioMetrics } = task;
+
+    currentParticipantId = participantId || 'default';
+    currentDisplayName = displayName || 'Remote Caller';
+    currentAudioMetrics = audioMetrics || { isSilent: true, audioScore: 100 };
+
+    try {
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        await faceMesh.send({ image: canvas });
+    } catch (err) {
+        logToMain("Frame processing error: " + err.message, true);
+    } finally {
+        bitmap.close(); // Mandatory cleanup
+        window.parent.postMessage({
+            type: 'FRAME_PROCESSED',
+            participantId: currentParticipantId
+        }, '*');
+
+        isProcessingQueue = false;
+
+        // Process next item in queue synchronously
+        if (frameQueue.length > 0) {
+            processQueue();
         }
+    }
+}
+
+/**
+ * Handle incoming frames transferred from content.js
+ */
+window.addEventListener('message', (e) => {
+    if (e.data.type === 'PROCESS_FRAME' && isModelReady) {
+        frameQueue.push(e.data);
+        processQueue();
     }
 });
 
 /**
- * Startup hook.
+ * Startup hook
  */
 window.addEventListener('load', () => {
     if (typeof tf === 'undefined') {
-        logToMain("CRITICAL: TensorFlow (tf) is missing! Ensure tf.min.js is present.", true);
+        logToMain("CRITICAL: TensorFlow (tf) is missing! Ensure tf.min.js is loaded.", true);
         return;
     }
     initFaceMesh();

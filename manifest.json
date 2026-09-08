@@ -35,7 +35,15 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["models/*", "tf.min.js", "face_mesh.js", "scanner.html", "scanner.js", "icons/*"],
+      "resources": [
+        "models/*",
+        "mediapipe/*",
+        "tf.min.js",
+        "face_mesh.js",
+        "scanner.html",
+        "scanner.js",
+        "icons/*"
+      ],
       "matches": ["<all_urls>"]
     }
   ],
