@@ -145,7 +145,9 @@
         }
 
         function updateDashboard(data) {
-            const safeId = toSafeId(data.participantId);
+            const rawId = (typeof data === 'object' && data !== null) ? (data.participantId || data.id) : data;
+            const score = (typeof data === 'object' && data !== null) ? data.score : arguments[1];
+            const safeId = toSafeId(rawId);
             const container = document.getElementById('df-cards-container');
             const emptyNotice = document.getElementById('df-empty-state');
             if (!container) return;
@@ -155,32 +157,63 @@
             }
 
             let card = document.getElementById(`df-card-${safeId}`);
-            const isAlert = data.score < 50;
-            const statusText = isAlert ? '⚠️ ALERT' : 'Authentic';
-            const cardAlertClass = isAlert ? 'df-participant-card alert' : 'df-participant-card';
-            const fillAlertClass = isAlert ? 'df-bar-fill alert' : 'df-bar-fill';
-
             if (!card) {
                 card = document.createElement('div');
                 card.id = `df-card-${safeId}`;
-                card.className = cardAlertClass;
+                card.className = 'df-participant-card';
                 container.appendChild(card);
-            } else {
-                card.className = cardAlertClass;
             }
+
+            const displayName = (typeof data === 'object' && data !== null && data.displayName)
+                ? data.displayName
+                : (activeParticipants.get(safeId)?.displayName || `Participant ${safeId}`);
+
+            // Specific conditional block to handle score === -1 (Neutral "Analyzing" state)
+            if (score === -1) {
+                card.className = 'df-participant-card neutral';
+                card.style.borderLeft = '3px solid #888888';
+
+                card.innerHTML = `
+                    <div class="df-card-top">
+                        <span class="df-name" title="${displayName}">${displayName}</span>
+                        <span class="df-score-val" style="color: #888888; font-size: 11px;">Trust: Analyzing...</span>
+                    </div>
+                    <div class="df-bar-track">
+                        <div class="df-bar-fill" style="width: 0%; background: #888888;"></div>
+                    </div>
+                    <div class="df-metrics-row">
+                        <span class="df-metric-chip">👁️ Vis: --%</span>
+                        <span class="df-metric-chip">🎙️ Aud: Muted</span>
+                        <span class="df-status-tag" style="margin-left: auto; color: #888888;">Insufficient Data</span>
+                    </div>
+                `;
+                updateGlobalBadge();
+                return;
+            }
+
+            // Valid scores (0 to 100): Retain existing green (#00ff88) and red (#ff3333) logic
+            const isAlert = score < 50;
+            const statusText = isAlert ? '⚠️ ALERT' : 'Authentic';
+            const alertColor = isAlert ? '#ff3333' : '#00ff88';
+            const cardAlertClass = isAlert ? 'df-participant-card alert' : 'df-participant-card';
+            const fillAlertClass = isAlert ? 'df-bar-fill alert' : 'df-bar-fill';
+            const visualScore = (typeof data === 'object' && data.visualScore !== undefined) ? data.visualScore : score;
+
+            card.className = cardAlertClass;
+            card.style.borderLeft = `3px solid ${alertColor}`;
 
             card.innerHTML = `
                 <div class="df-card-top">
-                    <span class="df-name" title="${data.displayName}">${data.displayName}</span>
-                    <span class="df-score-val">${data.score}%</span>
+                    <span class="df-name" title="${displayName}">${displayName}</span>
+                    <span class="df-score-val" style="color: ${alertColor};">${score}%</span>
                 </div>
                 <div class="df-bar-track">
-                    <div class="${fillAlertClass}" style="width: ${data.score}%;"></div>
+                    <div class="${fillAlertClass}" style="width: ${score}%; background: ${alertColor};"></div>
                 </div>
                 <div class="df-metrics-row">
-                    <span class="df-metric-chip">👁️ Vis: ${data.visualScore}%</span>
+                    <span class="df-metric-chip">👁️ Vis: ${visualScore}%</span>
                     <span class="df-metric-chip">🎙️ Aud: Muted</span>
-                    <span class="df-status-tag" style="margin-left: auto;">${statusText}</span>
+                    <span class="df-status-tag" style="margin-left: auto; color: ${alertColor};">${statusText}</span>
                 </div>
             `;
 
@@ -193,10 +226,14 @@
             if (!globalBadge || !wrapper) return;
 
             let hasAlert = false;
+            let allAnalyzing = true;
             for (const [_, data] of activeParticipants.entries()) {
-                if (data.score < 50) {
-                    hasAlert = true;
-                    break;
+                if (data.score !== -1) {
+                    allAnalyzing = false;
+                    if (data.score < 50) {
+                        hasAlert = true;
+                        break;
+                    }
                 }
             }
 
@@ -204,9 +241,15 @@
                 globalBadge.innerText = 'Deepfake Alert';
                 globalBadge.className = 'df-badge alert';
                 wrapper.classList.add('has-alert');
+            } else if (allAnalyzing) {
+                globalBadge.innerText = 'Analyzing...';
+                globalBadge.className = 'df-badge';
+                globalBadge.style.color = '#888888';
+                wrapper.classList.remove('has-alert');
             } else {
                 globalBadge.innerText = 'Secure';
                 globalBadge.className = 'df-badge';
+                globalBadge.style.color = '#00ff88';
                 wrapper.classList.remove('has-alert');
             }
         }

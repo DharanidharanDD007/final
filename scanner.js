@@ -211,8 +211,15 @@ function onFaceMeshResults(results) {
             tensorInput.dispose();
             prediction.dispose();
 
+            // Probability Calibration: Push unsure scores outward
+            // If fakeProb < 0.5, apply Math.pow(fakeProb, 2) to push it toward 0 (highly authentic).
+            // If fakeProb >= 0.5, apply Math.sqrt(fakeProb) to push it toward 1 (highly fake).
+            const calibratedFakeProb = fakeProb < 0.5
+                ? Math.pow(fakeProb, 2)
+                : Math.sqrt(fakeProb);
+
             // 4. Calculate Frame Visual Trust Score (100% = Authentic, 0% = Manipulated)
-            const frameVisualTrust = Math.max(0, Math.min(100, (1.0 - fakeProb) * 100));
+            const frameVisualTrust = Math.max(0, Math.min(100, (1.0 - calibratedFakeProb) * 100));
             state.visualBuffer.push(frameVisualTrust);
             if (state.visualBuffer.length > BUFFER_SIZE) {
                 state.visualBuffer.shift();
@@ -242,6 +249,22 @@ function onFaceMeshResults(results) {
                 state.fusedBuffer.shift();
             }
 
+            // Frame Threshold: Only send valid trust score if buffer has at least 5 frames
+            if (state.fusedBuffer.length < 5) {
+                window.parent.postMessage({
+                    type: 'SCORE_UPDATE',
+                    participantId: currentParticipantId,
+                    id: currentParticipantId,
+                    displayName: currentDisplayName,
+                    score: -1,
+                    visualScore: -1,
+                    audioScore: -1,
+                    isSilent: true,
+                    hasFace: true
+                }, '*');
+                return;
+            }
+
             // 7. Compute temporal moving averages across independent buffers
             const avgFused = Math.round(state.fusedBuffer.reduce((a, b) => a + b, 0) / state.fusedBuffer.length);
             const avgVisual = Math.round(state.visualBuffer.reduce((a, b) => a + b, 0) / state.visualBuffer.length);
@@ -251,6 +274,7 @@ function onFaceMeshResults(results) {
             window.parent.postMessage({
                 type: 'SCORE_UPDATE',
                 participantId: currentParticipantId,
+                id: currentParticipantId,
                 displayName: currentDisplayName,
                 score: avgFused,
                 visualScore: avgVisual,
@@ -266,17 +290,19 @@ function onFaceMeshResults(results) {
         // No face detected in frame
         state.consecutiveNoFace++;
 
-        if (state.consecutiveNoFace > BUFFER_SIZE) {
+        // Insufficient Data: If state.consecutiveNoFace > 5, reset buffers and send score: -1
+        if (state.consecutiveNoFace > 5) {
             state.visualBuffer.length = 0;
             state.audioBuffer.length = 0;
             state.fusedBuffer.length = 0;
             window.parent.postMessage({
                 type: 'SCORE_UPDATE',
                 participantId: currentParticipantId,
+                id: currentParticipantId,
                 displayName: currentDisplayName,
-                score: 100,
-                visualScore: 100,
-                audioScore: 100,
+                score: -1,
+                visualScore: -1,
+                audioScore: -1,
                 isSilent: true,
                 hasFace: false
             }, '*');
