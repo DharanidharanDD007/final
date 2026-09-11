@@ -146,7 +146,7 @@
 
         function updateDashboard(data) {
             const rawId = (typeof data === 'object' && data !== null) ? (data.participantId || data.id) : data;
-            const score = (typeof data === 'object' && data !== null) ? data.score : arguments[1];
+            const currentScore = Number((typeof data === 'object' && data !== null && data.score !== undefined) ? data.score : arguments[1]);
             const safeId = toSafeId(rawId);
             const container = document.getElementById('df-cards-container');
             const emptyNotice = document.getElementById('df-empty-state');
@@ -168,8 +168,8 @@
                 ? data.displayName
                 : (activeParticipants.get(safeId)?.displayName || `Participant ${safeId}`);
 
-            // Specific conditional block to handle score === -1 (Neutral "Analyzing" state)
-            if (score === -1) {
+            // Specific conditional block to handle currentScore < 0 (Neutral "Analyzing" state)
+            if (currentScore < 0) {
                 card.className = 'df-participant-card neutral';
                 card.style.borderLeft = '3px solid #888888';
 
@@ -192,12 +192,12 @@
             }
 
             // Valid scores (0 to 100): Retain existing green (#00ff88) and red (#ff3333) logic
-            const isAlert = score < 50;
+            const isAlert = currentScore < 50;
             const statusText = isAlert ? '⚠️ ALERT' : 'Authentic';
             const alertColor = isAlert ? '#ff3333' : '#00ff88';
             const cardAlertClass = isAlert ? 'df-participant-card alert' : 'df-participant-card';
             const fillAlertClass = isAlert ? 'df-bar-fill alert' : 'df-bar-fill';
-            const visualScore = (typeof data === 'object' && data.visualScore !== undefined) ? data.visualScore : score;
+            const visualScore = (typeof data === 'object' && data.visualScore !== undefined) ? data.visualScore : currentScore;
 
             card.className = cardAlertClass;
             card.style.borderLeft = `3px solid ${alertColor}`;
@@ -205,10 +205,10 @@
             card.innerHTML = `
                 <div class="df-card-top">
                     <span class="df-name" title="${displayName}">${displayName}</span>
-                    <span class="df-score-val" style="color: ${alertColor};">${score}%</span>
+                    <span class="df-score-val" style="color: ${alertColor};">${currentScore}%</span>
                 </div>
                 <div class="df-bar-track">
-                    <div class="${fillAlertClass}" style="width: ${score}%; background: ${alertColor};"></div>
+                    <div class="${fillAlertClass}" style="width: ${currentScore}%; background: ${alertColor};"></div>
                 </div>
                 <div class="df-metrics-row">
                     <span class="df-metric-chip">👁️ Vis: ${visualScore}%</span>
@@ -228,9 +228,10 @@
             let hasAlert = false;
             let allAnalyzing = true;
             for (const [_, data] of activeParticipants.entries()) {
-                if (data.score !== -1) {
+                const s = Number(data.score);
+                if (s >= 0) {
                     allAnalyzing = false;
-                    if (data.score < 50) {
+                    if (s < 50) {
                         hasAlert = true;
                         break;
                     }

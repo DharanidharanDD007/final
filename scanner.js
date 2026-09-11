@@ -181,15 +181,36 @@ function onFaceMeshResults(results) {
     state.displayName = currentDisplayName;
 
     if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
-        state.consecutiveNoFace = 0;
-
         try {
             const landmarks = results.multiFaceLandmarks[0];
             const { cropX, cropY, cropW, cropH } = computeFaceBoundingBox(landmarks, canvas.width, canvas.height);
 
-            if (cropW < 10 || cropH < 10) {
+            // Step 2: Strict Face Quality Gates (cropW < 60 or cropH < 60)
+            if (cropW < 60 || cropH < 60) {
+                state.consecutiveNoFace++;
+                state.visualBuffer.push(-1);
+                state.audioBuffer.push(-1);
+                state.fusedBuffer.push(-1);
+                if (state.visualBuffer.length > BUFFER_SIZE) state.visualBuffer.shift();
+                if (state.audioBuffer.length > BUFFER_SIZE) state.audioBuffer.shift();
+                if (state.fusedBuffer.length > BUFFER_SIZE) state.fusedBuffer.shift();
+
+                window.parent.postMessage({
+                    type: 'SCORE_UPDATE',
+                    participantId: currentParticipantId,
+                    id: currentParticipantId,
+                    displayName: currentDisplayName,
+                    score: -1,
+                    visualScore: -1,
+                    audioScore: -1,
+                    isSilent: true,
+                    hasFace: false
+                }, '*');
                 return;
             }
+
+            // Face passed quality gate
+            state.consecutiveNoFace = 0;
 
             // 1. Crop face ROI and scale into 64x64 auxiliary canvas
             faceCtx.clearRect(0, 0, 64, 64);
@@ -211,32 +232,26 @@ function onFaceMeshResults(results) {
             tensorInput.dispose();
             prediction.dispose();
 
-            // Probability Calibration: Push unsure scores outward
-            // If fakeProb < 0.5, apply Math.pow(fakeProb, 2) to push it toward 0 (highly authentic).
-            // If fakeProb >= 0.5, apply Math.sqrt(fakeProb) to push it toward 1 (highly fake).
-            const calibratedFakeProb = fakeProb < 0.5
-                ? Math.pow(fakeProb, 2)
-                : Math.sqrt(fakeProb);
+            // Step 3: Fix 50-60% Neutral Bias using Sharpened Sigmoid Calibration
+            let calibrated = 1 / (1 + Math.exp(-10 * (fakeProb - 0.5)));
+            const frameVisualTrust = Math.max(0, Math.min(100, (1.0 - calibrated) * 100));
 
-            // 4. Calculate Frame Visual Trust Score (100% = Authentic, 0% = Manipulated)
-            const frameVisualTrust = Math.max(0, Math.min(100, (1.0 - calibratedFakeProb) * 100));
+            // Only push this score to state.visualBuffer if the face met the quality gates
             state.visualBuffer.push(frameVisualTrust);
             if (state.visualBuffer.length > BUFFER_SIZE) {
                 state.visualBuffer.shift();
             }
 
-            // 5. Audio Consistency Score
+            // Audio Consistency Score (Dynamic Silence Fallback preserved)
             const audioConsistency = currentAudioMetrics.audioScore !== undefined ? currentAudioMetrics.audioScore : 100;
             state.audioBuffer.push(audioConsistency);
             if (state.audioBuffer.length > BUFFER_SIZE) {
                 state.audioBuffer.shift();
             }
 
-            // 6. Multimodal Fusion Equation:
-            // Final Trust Score = (w_v * Visual Trust) + (w_a * Audio Consistency Score)
+            // Multimodal Fusion Equation (w_v * Visual Trust + w_a * Audio Consistency)
             let frameFusedTrust;
             if (currentAudioMetrics.isSilent) {
-                // If caller is silent or muted, dynamic fallback to pure visual (w_v = 1.0, w_a = 0.0)
                 frameFusedTrust = frameVisualTrust;
             } else {
                 const w_v = 0.75;
@@ -249,8 +264,9 @@ function onFaceMeshResults(results) {
                 state.fusedBuffer.shift();
             }
 
-            // Frame Threshold: Only send valid trust score if buffer has at least 5 frames
-            if (state.fusedBuffer.length < 5) {
+            // Frame Threshold: Only send valid trust score if buffer has at least 5 valid frames
+            const validScores = state.fusedBuffer.filter(v => v >= 0);
+            if (validScores.length < 5) {
                 window.parent.postMessage({
                     type: 'SCORE_UPDATE',
                     participantId: currentParticipantId,
@@ -265,10 +281,12 @@ function onFaceMeshResults(results) {
                 return;
             }
 
-            // 7. Compute temporal moving averages across independent buffers
-            const avgFused = Math.round(state.fusedBuffer.reduce((a, b) => a + b, 0) / state.fusedBuffer.length);
-            const avgVisual = Math.round(state.visualBuffer.reduce((a, b) => a + b, 0) / state.visualBuffer.length);
-            const avgAudio = Math.round(state.audioBuffer.reduce((a, b) => a + b, 0) / state.audioBuffer.length);
+            // 7. Compute temporal moving averages across valid buffer frames
+            const avgFused = Math.round(validScores.reduce((a, b) => a + b, 0) / validScores.length);
+            const validVisual = state.visualBuffer.filter(v => v >= 0);
+            const avgVisual = validVisual.length > 0 ? Math.round(validVisual.reduce((a, b) => a + b, 0) / validVisual.length) : avgFused;
+            const validAudio = state.audioBuffer.filter(v => v >= 0);
+            const avgAudio = validAudio.length > 0 ? Math.round(validAudio.reduce((a, b) => a + b, 0) / validAudio.length) : 100;
 
             // 8. Transmit fused result to content script
             window.parent.postMessage({
@@ -289,12 +307,15 @@ function onFaceMeshResults(results) {
     } else {
         // No face detected in frame
         state.consecutiveNoFace++;
+        state.visualBuffer.push(-1);
+        state.audioBuffer.push(-1);
+        state.fusedBuffer.push(-1);
+        if (state.visualBuffer.length > BUFFER_SIZE) state.visualBuffer.shift();
+        if (state.audioBuffer.length > BUFFER_SIZE) state.audioBuffer.shift();
+        if (state.fusedBuffer.length > BUFFER_SIZE) state.fusedBuffer.shift();
 
-        // Insufficient Data: If state.consecutiveNoFace > 5, reset buffers and send score: -1
+        // Insufficient Data: If state.consecutiveNoFace > 5, send score: -1
         if (state.consecutiveNoFace > 5) {
-            state.visualBuffer.length = 0;
-            state.audioBuffer.length = 0;
-            state.fusedBuffer.length = 0;
             window.parent.postMessage({
                 type: 'SCORE_UPDATE',
                 participantId: currentParticipantId,
