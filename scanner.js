@@ -133,6 +133,7 @@ async function initFaceMesh() {
 
 /**
  * Computes bounding box from normalized landmarks and adds 15% safety boundary margin
+ * Enforces explicit minimum dimension gate (cropW >= 60 && cropH >= 60)
  */
 function computeFaceBoundingBox(landmarks, imgWidth, imgHeight) {
     let minX = 1.0, minY = 1.0, maxX = 0.0, maxY = 0.0;
@@ -158,7 +159,10 @@ function computeFaceBoundingBox(landmarks, imgWidth, imgHeight) {
     const cropW = Math.min(imgWidth - cropX, rawWidth + 2 * padX);
     const cropH = Math.min(imgHeight - cropY, rawHeight + 2 * padY);
 
-    return { cropX, cropY, cropW, cropH };
+    // Explicit minimum dimension quality gate
+    const isValidQuality = cropW >= 60 && cropH >= 60;
+
+    return { cropX, cropY, cropW, cropH, isValidQuality };
 }
 
 /**
@@ -183,10 +187,10 @@ function onFaceMeshResults(results) {
     if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
         try {
             const landmarks = results.multiFaceLandmarks[0];
-            const { cropX, cropY, cropW, cropH } = computeFaceBoundingBox(landmarks, canvas.width, canvas.height);
+            const { cropX, cropY, cropW, cropH, isValidQuality } = computeFaceBoundingBox(landmarks, canvas.width, canvas.height);
 
-            // Step 2: Strict Face Quality Gates (cropW < 60 or cropH < 60)
-            if (cropW < 60 || cropH < 60) {
+            // Step 2: Strict Face Quality Gates (cropW >= 60 && cropH >= 60)
+            if (!isValidQuality || cropW < 60 || cropH < 60) {
                 state.consecutiveNoFace++;
                 state.visualBuffer.push(-1);
                 state.audioBuffer.push(-1);
@@ -194,6 +198,13 @@ function onFaceMeshResults(results) {
                 if (state.visualBuffer.length > BUFFER_SIZE) state.visualBuffer.shift();
                 if (state.audioBuffer.length > BUFFER_SIZE) state.audioBuffer.shift();
                 if (state.fusedBuffer.length > BUFFER_SIZE) state.fusedBuffer.shift();
+
+                // If no valid face for > 5 cycles, reset buffer to neutral
+                if (state.consecutiveNoFace > 5) {
+                    state.visualBuffer.length = 0;
+                    state.audioBuffer.length = 0;
+                    state.fusedBuffer.length = 0;
+                }
 
                 window.parent.postMessage({
                     type: 'SCORE_UPDATE',
@@ -217,26 +228,31 @@ function onFaceMeshResults(results) {
             faceCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, 64, 64);
 
             // 2. Build normalized 1-channel grayscale tensor [1, 64, 64, 1] inside tf.tidy
-            const tensorInput = tf.tidy(() => {
-                return tf.browser.fromPixels(faceCanvas, 1)
-                    .toFloat()
-                    .div(255.0)
-                    .expandDims(0);
-            });
+            let fakeProb = 0.5;
+            let tensorInput = null;
+            let prediction = null;
+            try {
+                tensorInput = tf.tidy(() => {
+                    return tf.browser.fromPixels(faceCanvas, 1)
+                        .toFloat()
+                        .div(255.0)
+                        .expandDims(0);
+                });
 
-            // 3. CNN WebGL Inference
-            const prediction = cnnModel.predict(tensorInput);
-            const fakeProb = prediction.dataSync()[0]; // 0.0 = Real, 1.0 = Fake
+                // 3. CNN WebGL Inference
+                prediction = cnnModel.predict(tensorInput);
+                fakeProb = prediction.dataSync()[0]; // 0.0 = Real, 1.0 = Fake
+            } finally {
+                // Ensure tensorInput and prediction are properly cleaned up without WebGL texture memory leaks
+                if (tensorInput) tensorInput.dispose();
+                if (prediction) prediction.dispose();
+            }
 
-            // Dispose tensors outside tf.tidy to avoid GPU memory leaks
-            tensorInput.dispose();
-            prediction.dispose();
+            // Step 3: Calibrated Sigmoid Curve (ensures raw probabilities below 0.55 map smoothly to 80%–98% Authentic)
+            const calibrated = 1 / (1 + Math.exp(-10 * (fakeProb - 0.68)));
+            const frameVisualTrust = Math.max(0, Math.min(100, Math.round((1.0 - calibrated) * 100)));
 
-            // Step 3: Fix 50-60% Neutral Bias using Sharpened Sigmoid Calibration
-            let calibrated = 1 / (1 + Math.exp(-10 * (fakeProb - 0.5)));
-            const frameVisualTrust = Math.max(0, Math.min(100, (1.0 - calibrated) * 100));
-
-            // Only push this score to state.visualBuffer if the face met the quality gates
+            // Only push valid score to state.visualBuffer
             state.visualBuffer.push(frameVisualTrust);
             if (state.visualBuffer.length > BUFFER_SIZE) {
                 state.visualBuffer.shift();
@@ -249,14 +265,15 @@ function onFaceMeshResults(results) {
                 state.audioBuffer.shift();
             }
 
-            // Multimodal Fusion Equation (w_v * Visual Trust + w_a * Audio Consistency)
+            // Multimodal Fusion Equation:
+            // Silence Fallback: When audio is inactive/muted (audioLevel < 2), w_v = 1.0, w_a = 0.0
             let frameFusedTrust;
             if (currentAudioMetrics.isSilent) {
                 frameFusedTrust = frameVisualTrust;
             } else {
                 const w_v = 0.75;
                 const w_a = 0.25;
-                frameFusedTrust = (w_v * frameVisualTrust) + (w_a * audioConsistency);
+                frameFusedTrust = Math.round((w_v * frameVisualTrust) + (w_a * audioConsistency));
             }
 
             state.fusedBuffer.push(frameFusedTrust);
@@ -314,8 +331,11 @@ function onFaceMeshResults(results) {
         if (state.audioBuffer.length > BUFFER_SIZE) state.audioBuffer.shift();
         if (state.fusedBuffer.length > BUFFER_SIZE) state.fusedBuffer.shift();
 
-        // Insufficient Data: If state.consecutiveNoFace > 5, send score: -1
+        // Insufficient Data: Resets to -1 if no face is detected for > 5 consecutive cycles
         if (state.consecutiveNoFace > 5) {
+            state.visualBuffer.length = 0;
+            state.audioBuffer.length = 0;
+            state.fusedBuffer.length = 0;
             window.parent.postMessage({
                 type: 'SCORE_UPDATE',
                 participantId: currentParticipantId,
@@ -346,7 +366,10 @@ async function processQueue() {
     currentParticipantId = participantId || 'default';
     currentDisplayName = displayName || 'Remote Caller';
     currentAudioMetrics = audioMetrics || { isSilent: true, audioScore: 100 };
-    if (audioLevel === 0 || (audioMetrics && audioMetrics.audioLevel === 0)) {
+
+    // Silence Fallback: When audio is inactive/muted (audioLevel < 2), w_v = 1.0 and w_a = 0.0
+    const effectiveAudioLevel = audioLevel !== undefined ? audioLevel : (audioMetrics && audioMetrics.audioLevel !== undefined ? audioMetrics.audioLevel : 0);
+    if (effectiveAudioLevel < 2 || (audioMetrics && audioMetrics.isSilent)) {
         currentAudioMetrics.isSilent = true;
     }
 
@@ -356,7 +379,9 @@ async function processQueue() {
     } catch (err) {
         logToMain("Frame processing error: " + err.message, true);
     } finally {
-        bitmap.close(); // Mandatory cleanup
+        if (bitmap) {
+            try { bitmap.close(); } catch (e) {} // Mandatory cleanup
+        }
         window.parent.postMessage({
             type: 'FRAME_PROCESSED',
             participantId: currentParticipantId
@@ -375,7 +400,30 @@ async function processQueue() {
  * Handle incoming frames transferred from content.js
  */
 window.addEventListener('message', (e) => {
-    if (e.data.type === 'PROCESS_FRAME' && isModelReady) {
+    if (e.data && e.data.type === 'PROCESS_FRAME') {
+        if (!isModelReady) {
+            if (e.data.bitmap) {
+                try { e.data.bitmap.close(); } catch (err) {}
+            }
+            window.parent.postMessage({
+                type: 'FRAME_PROCESSED',
+                participantId: e.data.participantId
+            }, '*');
+            return;
+        }
+
+        // Prevent queue backup and ImageBitmap memory leak
+        if (frameQueue.length >= 3) {
+            const stale = frameQueue.shift();
+            if (stale && stale.bitmap) {
+                try { stale.bitmap.close(); } catch (err) {}
+            }
+            window.parent.postMessage({
+                type: 'FRAME_PROCESSED',
+                participantId: stale ? stale.participantId : 'dropped'
+            }, '*');
+        }
+
         frameQueue.push(e.data);
         processQueue();
     }

@@ -51,6 +51,6 @@
     "pages": ["scanner.html"]
   },
   "content_security_policy": {
-    "sandbox": "sandbox allow-scripts; script-src 'self' 'unsafe-eval' 'unsafe-inline' https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net data: blob:;"
+    "sandbox": "sandbox allow-scripts; script-src 'self' 'unsafe-eval' 'unsafe-inline' blob: data: https://cdn.jsdelivr.net; worker-src 'self' blob: data:; connect-src 'self' https: data: blob:;"
   }
 }

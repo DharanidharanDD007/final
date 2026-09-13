@@ -145,6 +145,7 @@
         }
 
         function updateDashboard(data) {
+            if (!data) return;
             const rawId = (typeof data === 'object' && data !== null) ? (data.participantId || data.id) : data;
             const currentScore = Number((typeof data === 'object' && data !== null && data.score !== undefined) ? data.score : arguments[1]);
             const safeId = toSafeId(rawId);
@@ -168,8 +169,9 @@
                 ? data.displayName
                 : (activeParticipants.get(safeId)?.displayName || `Participant ${safeId}`);
 
-            // Specific conditional block to handle currentScore < 0 (Neutral "Analyzing" state)
-            if (currentScore < 0) {
+            // Specific conditional block to handle score === -1 or invalid score (Neutral "Analyzing" state)
+            // Explicit return prevents any fall-through to < 50 red alert styling
+            if (currentScore === -1 || currentScore < 0 || isNaN(currentScore)) {
                 card.className = 'df-participant-card neutral';
                 card.style.borderLeft = '3px solid #888888';
 
@@ -191,7 +193,7 @@
                 return;
             }
 
-            // Valid scores (0 to 100): Retain existing green (#00ff88) and red (#ff3333) logic
+            // Valid scores (0 to 100): Retain green (#00ff88) and red (#ff3333) logic
             const isAlert = currentScore < 50;
             const statusText = isAlert ? '⚠️ ALERT' : 'Authentic';
             const alertColor = isAlert ? '#ff3333' : '#00ff88';
@@ -225,11 +227,19 @@
             const wrapper = document.getElementById('df-wrapper');
             if (!globalBadge || !wrapper) return;
 
+            if (activeParticipants.size === 0) {
+                globalBadge.innerText = 'Monitoring';
+                globalBadge.className = 'df-badge';
+                globalBadge.style.color = '';
+                wrapper.classList.remove('has-alert');
+                return;
+            }
+
             let hasAlert = false;
             let allAnalyzing = true;
             for (const [_, data] of activeParticipants.entries()) {
                 const s = Number(data.score);
-                if (s >= 0) {
+                if (!isNaN(s) && s >= 0) {
                     allAnalyzing = false;
                     if (s < 50) {
                         hasAlert = true;
@@ -287,7 +297,14 @@
             scannerIframe = document.createElement('iframe');
             scannerIframe.src = chrome.runtime.getURL('scanner.html');
             scannerIframe.style.display = 'none';
-            document.body.appendChild(scannerIframe);
+
+            if (document.body) {
+                document.body.appendChild(scannerIframe);
+            } else {
+                document.addEventListener('DOMContentLoaded', () => {
+                    document.body.appendChild(scannerIframe);
+                });
+            }
 
             window.addEventListener('message', (e) => {
                 if (e.data.type === 'SCANNER_READY') {
@@ -301,9 +318,9 @@
                     const record = {
                         participantId,
                         displayName,
-                        score,
-                        visualScore,
-                        audioScore,
+                        score: Number(score),
+                        visualScore: Number(visualScore),
+                        audioScore: Number(audioScore),
                         isSilent: true,
                         hasFace,
                         lastSeen: Date.now()
@@ -334,10 +351,12 @@
                 if (vid.readyState >= 1 && vid.videoWidth > 0 && !vid.paused) {
                     const rect = vid.getBoundingClientRect();
                     const area = rect.width * rect.height;
-                    const isMirrored = vid.style.transform && vid.style.transform.includes('scaleX(-1)');
+                    const inlineTransform = vid.style.transform || '';
+                    const computedTransform = window.getComputedStyle(vid).transform || '';
+                    const isMirrored = inlineTransform.includes('scaleX(-1)') || computedTransform.includes('matrix(-1');
 
-                    // Exclude local mirrored self-view and tiny thumbnail icons
-                    if (!isMirrored && area > 3000) {
+                    // Exclude local mirrored self-view and tiny thumbnail icons (< 3000px area)
+                    if (!isMirrored && area > 3000 && rect.width > 0 && rect.height > 0) {
                         if (!vid.dataset.dfParticipantId) {
                             vid.dataset.dfParticipantId = `part-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
                         }
@@ -352,8 +371,16 @@
             return remoteVideos;
         }
 
+        let lastProcessingTime = 0;
+
         function captureGrid() {
             const videos = getRemoteVideos();
+
+            // Safety Watchdog: Reset isProcessing if a frame hangs for > 4 seconds
+            if (isProcessing && Date.now() - lastProcessingTime > 4000) {
+                console.warn("⚠️ [Deepfake Detector]: Frame processing timeout watchdog triggered. Resetting pipeline.");
+                isProcessing = false;
+            }
 
             if (videos.length > 0 && !isProcessing && scannerReady) {
                 const targetVideo = videos[roundRobinIndex % videos.length];
@@ -364,25 +391,37 @@
 
                 // WebRTC-Safe: Pure ImageBitmap snapshot, zero stream hijacking
                 isProcessing = true;
+                lastProcessingTime = Date.now();
+
                 createImageBitmap(targetVideo).then((bitmap) => {
-                    scannerIframe.contentWindow.postMessage(
-                        {
-                            type: 'PROCESS_FRAME',
-                            bitmap: bitmap,
-                            participantId: participantId,
-                            displayName: displayName,
-                            audioLevel: 0,
-                            audioMetrics: {
-                                isSilent: true,
-                                audioScore: 100,
-                                audioLevel: 0,
-                                rms: 0,
-                                spectralCentroid: 0
-                            }
-                        },
-                        '*',
-                        [bitmap]
-                    );
+                    try {
+                        if (scannerIframe && scannerIframe.contentWindow) {
+                            scannerIframe.contentWindow.postMessage(
+                                {
+                                    type: 'PROCESS_FRAME',
+                                    bitmap: bitmap,
+                                    participantId: participantId,
+                                    displayName: displayName,
+                                    audioLevel: 0,
+                                    audioMetrics: {
+                                        isSilent: true,
+                                        audioScore: 100,
+                                        audioLevel: 0,
+                                        rms: 0,
+                                        spectralCentroid: 0
+                                    }
+                                },
+                                '*',
+                                [bitmap]
+                            );
+                        } else {
+                            if (bitmap) try { bitmap.close(); } catch (e) {}
+                            isProcessing = false;
+                        }
+                    } catch (postErr) {
+                        if (bitmap) try { bitmap.close(); } catch (e) {}
+                        isProcessing = false;
+                    }
                 }).catch(() => {
                     isProcessing = false;
                 });

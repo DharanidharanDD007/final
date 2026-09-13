@@ -147,6 +147,11 @@
     background: rgba(239, 68, 68, 0.12);
 }
 
+.df-participant-card.neutral {
+    border-left-color: #888888;
+    background: rgba(51, 65, 85, 0.4);
+}
+
 .df-card-top {
     display: flex;
     justify-content: space-between;
